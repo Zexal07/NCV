@@ -8,4 +8,6 @@ This repository contains a modular pipeline for ingesting PDF documents into vec
 * **Portable Vector Stores (Knowledge Bases)**   Embeddings are stored in categorized vector databases (e.g., by domain or use case), which can be transferred and reused across machines without re-running ingestion scripts.  
 * **Metadata-Driven Retrieval**   Enables retrieval of relevant content chunks using both semantic similarity and fine-grained metadata filters (e.g., document type, company name, year).
 * **Separation of Concerns**   Clean separation between:    * Ingestion logic (run once to create the store)   * Retrieval logic (used repeatedly in different contexts)  
-### 🎯 Use Case  Perfect for building reusable, portable, and scalable **document intelligence systems**, especially for tasks like ESG reporting, enterprise search, and RAG (retrieval-augmented generation) pipelines.  ---  Let me know if you want this adapted for a `README.md` layout or if you'd like badges, usage examples, or diagrams included.
+### 🎯 Use Case  
+
+Perfect for building reusable, portable, and scalable **document intelligence systems**, especially for tasks like ESG reporting, enterprise search, and RAG (retrieval-augmented generation) pipelines.  ---  Let me know if you want this adapted for a `README.md` layout or if you'd like badges, usage examples, or diagrams included.
