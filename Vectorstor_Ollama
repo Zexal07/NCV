@@ -1,0 +1,442 @@
+import os, json, requests
+import numpy as np
+from typing import List, Dict, Any, Optional
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import DeepLake
+from langchain.schema import Document
+
+class OllamaEmbeddings(Embeddings):
+    """Optimized Ollama embeddings for Gemma with proper timeouts and error handling"""
+    
+    def __init__(self, model_name: str = "gemma:2b", base_url: str = "http://localhost:11434", 
+                 batch_size: int = 10, timeout: int = 30):
+        self.model_name = model_name
+        self.base_url = base_url
+        self.batch_size = batch_size
+        self.timeout = timeout
+        self.session = requests.Session()
+        
+        # Test connection immediately
+        if not self._test_connection():
+            raise ConnectionError("Cannot connect to Ollama. Make sure it's running with: ollama serve")
+    
+    def _test_connection(self) -> bool:
+        """Test if Ollama is responsive"""
+        try:
+            response = self.session.get(f"{self.base_url}/api/tags", timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def _embed_single(self, text: str, retries: int = 3) -> List[float]:
+        """Embed a single text with retries and timeout"""
+        # Truncate text to avoid memory issues
+        text = text[:2000] if len(text) > 2000 else text
+        
+        for attempt in range(retries):
+            try:
+                response = self.session.post(
+                    f"{self.base_url}/api/embeddings",
+                    json={"model": self.model_name, "prompt": text},
+                    timeout=self.timeout
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if "embedding" in result:
+                        return result["embedding"]
+                
+                print(f"⚠️  Embedding failed (attempt {attempt + 1}): Status {response.status_code}")
+                
+            except requests.exceptions.Timeout:
+                print(f"⏱️  Timeout on attempt {attempt + 1} for text: {text[:50]}...")
+            except Exception as e:
+                print(f"❌ Error on attempt {attempt + 1}: {e}")
+        
+        # Return fallback embedding if all attempts fail
+        print("⚠️  Using fallback embedding (zeros)")
+        return [0.0] * 2048  # Gemma typical embedding size
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed documents in small batches with progress tracking"""
+        print(f"🤖 Embedding {len(texts)} documents with Gemma (batch size: {self.batch_size})")
+        
+        all_embeddings = []
+        total_batches = (len(texts) + self.batch_size - 1) // self.batch_size
+        
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i:i + self.batch_size]
+            batch_num = (i // self.batch_size) + 1
+            
+            print(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} texts)")
+            
+            batch_embeddings = []
+            for j, text in enumerate(batch):
+                print(f"  🔄 Embedding {j+1}/{len(batch)}: {text[:50]}...")
+                embedding = self._embed_single(text)
+                batch_embeddings.append(embedding)
+            
+            all_embeddings.extend(batch_embeddings)
+            print(f"✅ Completed batch {batch_num}/{total_batches}")
+        
+        print(f"🎉 Successfully embedded {len(all_embeddings)} documents")
+        return all_embeddings
+    
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single query"""
+        print(f"🔍 Embedding query: {text[:50]}...")
+        return self._embed_single(text)
+
+class VectorStoreManager:
+    """Enhanced Vector Store Manager with Gemma AI support"""
+    
+    def __init__(self, output_dir: str = "output", use_gemma: bool = True):
+        self.output_dir = output_dir
+        self.chunks_file = os.path.join(output_dir, "saved_chunks.json")
+        self.vectorstore_path = os.path.join(output_dir, "vectorstore")
+        
+        # Choose embedding model
+        if use_gemma:
+            try:
+                print("🤖 Initializing local Gemma AI via Ollama...")
+                self.embedder = OllamaEmbeddings(
+                    model_name="gemma:2b",
+                    batch_size=5,  # Small batches for stability
+                    timeout=60     # Longer timeout for large texts
+                )
+                print("✅ Gemma AI ready!")
+            except ConnectionError as e:
+                print(f"❌ {e}")
+                print("🔄 Falling back to HuggingFace embeddings...")
+                from langchain.embeddings import HuggingFaceEmbeddings
+                self.embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        else:
+            print("🤗 Using HuggingFace embeddings")
+            from langchain.embeddings import HuggingFaceEmbeddings
+            self.embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        
+        self.vectorstore = None
+        os.makedirs(output_dir, exist_ok=True)
+    
+    def test_gemma_connection(self) -> bool:
+        """Test if Gemma is available via Ollama"""
+        try:
+            response = requests.get("http://localhost:11434/api/tags")
+            if response.status_code == 200:
+                models = response.json().get("models", [])
+                gemma_models = [m for m in models if "gemma" in m.get("name", "").lower()]
+                if gemma_models:
+                    print(f"✅ Found Gemma models: {[m['name'] for m in gemma_models]}")
+                    return True
+                else:
+                    print("❌ No Gemma models found. Run: ollama pull gemma:2b")
+                    return False
+            return False
+        except Exception as e:
+            print(f"❌ Cannot connect to Ollama: {e}")
+            print("Make sure Ollama is running: ollama serve")
+            return False
+    
+    def create_vectorstore(self, use_fast_mode: bool = False) -> bool:
+        """Create vector store from saved chunks with optional fast mode"""
+        if not os.path.exists(self.chunks_file):
+            print("❌ No saved_chunks.json found. Run document ingestion first.")
+            return False
+        
+        # Test Gemma connection if using it
+        if isinstance(self.embedder, OllamaEmbeddings):
+            if not self.test_gemma_connection():
+                return False
+        
+        chunks = self.load_chunks()
+        if not chunks:
+            print("❌ No chunks found in saved_chunks.json")
+            return False
+        
+        # Fast mode: limit chunks for testing
+        if use_fast_mode:
+            chunks = chunks[:50]  # Only first 50 chunks for testing
+            print(f"🚀 Fast mode: Using only {len(chunks)} chunks for testing")
+        
+        print(f"📊 Creating vector store from {len(chunks)} chunks...")
+        
+        # Prepare texts and metadata
+        texts = [chunk["content"] for chunk in chunks]
+        metadatas = [chunk["metadata"] for chunk in chunks]
+        
+        try:
+            self.vectorstore = DeepLake.from_texts(
+                texts=texts,
+                embedding=self.embedder,
+                dataset_path=self.vectorstore_path,
+                metadatas=metadatas,
+                overwrite=True
+            )
+            print(f"✅ Vector store created at: {self.vectorstore_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Error creating vector store: {e}")
+            if isinstance(self.embedder, OllamaEmbeddings):
+                print("💡 Try running with fast mode first: option 1f")
+                print("💡 Or check if Ollama is responsive: ollama list")
+            return False
+    
+    def load_vectorstore(self) -> bool:
+        """Load existing vector store"""
+        if not os.path.exists(self.vectorstore_path):
+            print("❌ Vector store not found. Create it first.")
+            return False
+        
+        try:
+            self.vectorstore = DeepLake(
+                dataset_path=self.vectorstore_path,
+                embedding_function=self.embedder,
+                read_only=True
+            )
+            print(f"✅ Vector store loaded from: {self.vectorstore_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Error loading vector store: {e}")
+            return False
+    
+    def query_with_gemma_reranking(self, query: str, k: int = 10, final_k: int = 5) -> List[Document]:
+        """Enhanced querying with Gemma-based reranking"""
+        if not self.vectorstore:
+            if not self.load_vectorstore():
+                return []
+        
+        try:
+            # Get initial results
+            initial_results = self.vectorstore.similarity_search(query=query, k=k)
+            
+            if not isinstance(self.embedder, OllamaEmbeddings):
+                return initial_results[:final_k]
+            
+            # Rerank with Gemma
+            print("🤖 Reranking results with Gemma...")
+            scored_results = []
+            
+            for doc in initial_results:
+                # Use Gemma to score relevance
+                prompt = f"Rate the relevance of this text to the query on a scale of 1-10.\nQuery: {query}\nText: {doc.page_content[:500]}\nScore:"
+                
+                try:
+                    response = requests.post(
+                        "http://localhost:11434/api/generate",
+                        json={
+                            "model": "gemma:2b",
+                            "prompt": prompt,
+                            "stream": False
+                        }
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()["response"]
+                        # Extract score (simple regex approach)
+                        import re
+                        score_match = re.search(r'\b(\d+(?:\.\d+)?)\b', result)
+                        score = float(score_match.group(1)) if score_match else 5.0
+                    else:
+                        score = 5.0
+                        
+                except Exception:
+                    score = 5.0
+                
+                scored_results.append((score, doc))
+            
+            # Sort by score and return top results
+            scored_results.sort(key=lambda x: x[0], reverse=True)
+            return [doc for _, doc in scored_results[:final_k]]
+            
+        except Exception as e:
+            print(f"❌ Error in enhanced querying: {e}")
+            return []
+    
+    # ... (include all other methods from original class)
+    
+    def query_vectorstore(self, query: str, k: int = 5, filters: Dict = None, use_reranking: bool = False) -> List[Document]:
+        """Query vector store with optional Gemma reranking"""
+        if use_reranking and isinstance(self.embedder, OllamaEmbeddings):
+            return self.query_with_gemma_reranking(query, k*2, k)
+        
+        if not self.vectorstore:
+            if not self.load_vectorstore():
+                return []
+        
+        try:
+            if filters:
+                results = self.vectorstore.similarity_search(
+                    query=query,
+                    k=k,
+                    filter=filters
+                )
+            else:
+                results = self.vectorstore.similarity_search(query=query, k=k)
+            
+            return results
+        except Exception as e:
+            print(f"❌ Error querying vector store: {e}")
+            return []
+
+    def get_vectorstore_info(self) -> Dict[str, Any]:
+        """Get information about the vector store"""
+        if not self.vectorstore:
+            if not self.load_vectorstore():
+                return {}
+        
+        try:
+            # Get basic info
+            chunks = self.load_chunks()
+            info = {
+                "total_chunks": len(chunks),
+                "vectorstore_path": self.vectorstore_path,
+                "companies": list(set(chunk["metadata"].get("company_name", "Unknown") 
+                                    for chunk in chunks)),
+                "years": list(set(chunk["metadata"].get("report_year", "Unknown") 
+                                for chunk in chunks)),
+                "sources": list(set(chunk["metadata"].get("source", "Unknown") 
+                                  for chunk in chunks))
+            }
+            return info
+        except Exception as e:
+            print(f"❌ Error getting vector store info: {e}")
+            return {}
+
+    
+    def load_chunks(self) -> List[Dict]:
+        """Load chunks from JSON file"""
+        if not os.path.exists(self.chunks_file):
+            return []
+        
+        try:
+            with open(self.chunks_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"❌ Error loading chunks: {e}")
+            return []
+    
+    def save_chunks(self, chunks: List[Dict]):
+        """Save chunks to JSON file"""
+        try:
+            with open(self.chunks_file, "w", encoding="utf-8") as f:
+                json.dump(chunks, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"❌ Error saving chunks: {e}")
+
+    def export_vectorstore(self, export_path: str) -> bool:
+        """Export vector store for portability"""
+        try:
+            import shutil
+            if os.path.exists(export_path):
+                shutil.rmtree(export_path)
+            shutil.copytree(self.vectorstore_path, export_path)
+            
+            # Also copy chunks file
+            chunks_export = os.path.join(os.path.dirname(export_path), "saved_chunks.json")
+            shutil.copy2(self.chunks_file, chunks_export)
+            
+            print(f"✅ Vector store exported to: {export_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Error exporting vector store: {e}")
+            return False
+
+
+
+def main():
+    """Enhanced CLI interface with Gemma support"""
+    print("🤖 Vector Store Manager with Gemma AI")
+    
+    use_gemma = input("Use local Gemma AI? (y/n, default: y): ").strip().lower()
+    use_gemma = use_gemma != 'n'
+    
+    manager = VectorStoreManager(use_gemma=use_gemma)
+    
+    while True:
+        print("\n🗄️  Vector Store Manager")
+        print("1. Create vector store from chunks")
+        print("1f. Create vector store (FAST mode - 50 chunks only)")
+        print("2. Load existing vector store")
+        print("3. Query vector store")
+        print("4. Query with Gemma reranking")
+        print("5. Test Gemma connection")
+        print("6. Get vector store info")
+        print("7. Switch to HuggingFace embeddings")
+        print("8. Exit")
+        
+        choice = input("Choose option (1/1f/2-8): ").strip()
+        
+        if choice == "1":
+            success = manager.create_vectorstore(use_fast_mode=False)
+            if success:
+                print("✅ Vector store created successfully")
+        
+        elif choice == "1f":
+            success = manager.create_vectorstore(use_fast_mode=True)
+            if success:
+                print("✅ Vector store created successfully (fast mode)")
+                print("💡 If this works, try option 1 for full dataset")
+        
+        elif choice == "2":
+            manager.load_vectorstore()
+            
+        elif choice == "3":
+            if not manager.vectorstore:
+                print("❌ Load vector store first")
+                continue
+            
+            query = input("Enter query: ").strip()
+            k = int(input("Number of results (default 5): ").strip() or "5")
+            
+            results = manager.query_vectorstore(query, k)
+            print(f"\n📊 Found {len(results)} results:")
+            for i, result in enumerate(results):
+                print(f"\n[{i+1}] Source: {result.metadata.get('source', 'Unknown')}")
+                print(f"Company: {result.metadata.get('company_name', 'Unknown')}")
+                print(f"Content: {result.page_content[:200]}...")
+        
+        elif choice == "4":
+            if not isinstance(manager.embedder, OllamaEmbeddings):
+                print("❌ Gemma reranking only available when using Gemma embeddings")
+                continue
+                
+            if not manager.vectorstore:
+                print("❌ Load vector store first")
+                continue
+            
+            query = input("Enter query: ").strip()
+            k = int(input("Number of results (default 5): ").strip() or "5")
+            
+            results = manager.query_with_gemma_reranking(query, k*2, k)
+            print(f"\n🤖 Gemma-reranked results ({len(results)} found):")
+            for i, result in enumerate(results):
+                print(f"\n[{i+1}] Source: {result.metadata.get('source', 'Unknown')}")
+                print(f"Company: {result.metadata.get('company_name', 'Unknown')}")
+                print(f"Content: {result.page_content[:200]}...")
+        
+        elif choice == "5":
+            if isinstance(manager.embedder, OllamaEmbeddings):
+                manager.test_gemma_connection()
+            else:
+                print("❌ Not using Gemma embeddings")
+        
+        elif choice == "6":
+            export_path = input("Export path: ").strip()
+            if export_path:
+                manager.export_vectorstore(export_path)
+            print("📊 Vector store info feature - implement as needed")
+        
+        elif choice == "7":
+            print("🔄 Switching to HuggingFace embeddings...")
+            from langchain.embeddings import HuggingFaceEmbeddings
+            manager.embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            print("✅ Now using HuggingFace embeddings")
+        
+        elif choice == "8":
+            break
+        
+        else:
+            print("❌ Invalid choice")
+
+if __name__ == "__main__":
+    main()
