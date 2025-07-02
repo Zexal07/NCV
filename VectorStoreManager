@@ -1,0 +1,280 @@
+import os, json
+from typing import List, Dict, Any, Optional
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import DeepLake
+from langchain.schema import Document
+
+class VectorStoreManager:
+    """Module 2: Vector Store Manager - Handles persistent vector storage and querying"""
+    
+    def __init__(self, output_dir: str = "output"):
+        self.output_dir = output_dir
+        self.chunks_file = os.path.join(output_dir, "saved_chunks.json")
+        self.vectorstore_path = os.path.join(output_dir, "vectorstore")
+        self.embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        self.vectorstore = None
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+    
+    def create_vectorstore(self) -> bool:
+        """Create vector store from saved chunks"""
+        if not os.path.exists(self.chunks_file):
+            print("❌ No saved_chunks.json found. Run document ingestion first.")
+            return False
+        
+        # Load chunks
+        chunks = self.load_chunks()
+        if not chunks:
+            print("❌ No chunks found in saved_chunks.json")
+            return False
+        
+        print(f"📊 Creating vector store from {len(chunks)} chunks...")
+        
+        # Prepare texts and metadata
+        texts = [chunk["content"] for chunk in chunks]
+        metadatas = [chunk["metadata"] for chunk in chunks]
+        
+        # Create vector store
+        try:
+            self.vectorstore = DeepLake.from_texts(
+                texts=texts,
+                embedding=self.embedder,
+                dataset_path=self.vectorstore_path,
+                metadatas=metadatas,
+                overwrite=True
+            )
+            print(f"✅ Vector store created at: {self.vectorstore_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Error creating vector store: {e}")
+            return False
+    
+    def load_vectorstore(self) -> bool:
+        """Load existing vector store"""
+        if not os.path.exists(self.vectorstore_path):
+            print("❌ Vector store not found. Create it first.")
+            return False
+        
+        try:
+            self.vectorstore = DeepLake(
+                dataset_path=self.vectorstore_path,
+                embedding_function=self.embedder,
+                read_only=True
+            )
+            print(f"✅ Vector store loaded from: {self.vectorstore_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Error loading vector store: {e}")
+            return False
+    
+    def update_vectorstore(self, new_chunks: List[Dict]) -> bool:
+        """Update vector store with new chunks"""
+        if not self.vectorstore:
+            print("❌ Vector store not loaded")
+            return False
+        
+        try:
+            texts = [chunk["content"] for chunk in new_chunks]
+            metadatas = [chunk["metadata"] for chunk in new_chunks]
+            
+            self.vectorstore.add_texts(texts=texts, metadatas=metadatas)
+            
+            # Update saved chunks file
+            existing_chunks = self.load_chunks()
+            existing_chunks.extend(new_chunks)
+            self.save_chunks(existing_chunks)
+            
+            print(f"✅ Added {len(new_chunks)} new chunks to vector store")
+            return True
+        except Exception as e:
+            print(f"❌ Error updating vector store: {e}")
+            return False
+    
+    def query_vectorstore(self, query: str, k: int = 5, filters: Dict = None) -> List[Document]:
+        """Query vector store with optional metadata filters"""
+        if not self.vectorstore:
+            if not self.load_vectorstore():
+                return []
+        
+        try:
+            if filters:
+                # Apply metadata filtering
+                results = self.vectorstore.similarity_search(
+                    query=query,
+                    k=k,
+                    filter=filters
+                )
+            else:
+                results = self.vectorstore.similarity_search(query=query, k=k)
+            
+            return results
+        except Exception as e:
+            print(f"❌ Error querying vector store: {e}")
+            return []
+    
+    def get_vectorstore_info(self) -> Dict[str, Any]:
+        """Get information about the vector store"""
+        if not self.vectorstore:
+            if not self.load_vectorstore():
+                return {}
+        
+        try:
+            # Get basic info
+            chunks = self.load_chunks()
+            info = {
+                "total_chunks": len(chunks),
+                "vectorstore_path": self.vectorstore_path,
+                "companies": list(set(chunk["metadata"].get("company_name", "Unknown") 
+                                    for chunk in chunks)),
+                "years": list(set(chunk["metadata"].get("report_year", "Unknown") 
+                                for chunk in chunks)),
+                "sources": list(set(chunk["metadata"].get("source", "Unknown") 
+                                  for chunk in chunks))
+            }
+            return info
+        except Exception as e:
+            print(f"❌ Error getting vector store info: {e}")
+            return {}
+    
+    def search_by_metadata(self, metadata_filters: Dict, limit: int = 10) -> List[Dict]:
+        """Search chunks by metadata criteria"""
+        chunks = self.load_chunks()
+        if not chunks:
+            return []
+        
+        filtered_chunks = []
+        for chunk in chunks:
+            match = True
+            for key, value in metadata_filters.items():
+                chunk_value = chunk["metadata"].get(key)
+                if isinstance(value, list):
+                    if chunk_value not in value:
+                        match = False
+                        break
+                elif chunk_value != value:
+                    match = False
+                    break
+            
+            if match:
+                filtered_chunks.append(chunk)
+                if len(filtered_chunks) >= limit:
+                    break
+        
+        return filtered_chunks
+    
+    def load_chunks(self) -> List[Dict]:
+        """Load chunks from JSON file"""
+        if not os.path.exists(self.chunks_file):
+            return []
+        
+        try:
+            with open(self.chunks_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"❌ Error loading chunks: {e}")
+            return []
+    
+    def save_chunks(self, chunks: List[Dict]):
+        """Save chunks to JSON file"""
+        try:
+            with open(self.chunks_file, "w", encoding="utf-8") as f:
+                json.dump(chunks, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"❌ Error saving chunks: {e}")
+    
+    def export_vectorstore(self, export_path: str) -> bool:
+        """Export vector store for portability"""
+        try:
+            import shutil
+            if os.path.exists(export_path):
+                shutil.rmtree(export_path)
+            shutil.copytree(self.vectorstore_path, export_path)
+            
+            # Also copy chunks file
+            chunks_export = os.path.join(os.path.dirname(export_path), "saved_chunks.json")
+            shutil.copy2(self.chunks_file, chunks_export)
+            
+            print(f"✅ Vector store exported to: {export_path}")
+            return True
+        except Exception as e:
+            print(f"❌ Error exporting vector store: {e}")
+            return False
+
+def main():
+    """CLI interface for vector store management"""
+    manager = VectorStoreManager()
+    
+    while True:
+        print("\n🗄️  Vector Store Manager")
+        print("1. Create vector store from chunks")
+        print("2. Load existing vector store")
+        print("3. Query vector store")
+        print("4. Get vector store info")
+        print("5. Search by metadata")
+        print("6. Export vector store")
+        print("7. Exit")
+        
+        choice = input("Choose option (1-7): ").strip()
+        
+        if choice == "1":
+            success = manager.create_vectorstore()
+            if success:
+                print("✅ Vector store created successfully")
+        
+        elif choice == "2":
+            success = manager.load_vectorstore()
+            
+        elif choice == "3":
+            if not manager.vectorstore:
+                print("❌ Load vector store first")
+                continue
+            
+            query = input("Enter query: ").strip()
+            k = int(input("Number of results (default 5): ").strip() or "5")
+            
+            results = manager.query_vectorstore(query, k)
+            print(f"\n📊 Found {len(results)} results:")
+            for i, result in enumerate(results):
+                print(f"\n[{i+1}] Source: {result.metadata.get('source', 'Unknown')}")
+                print(f"Company: {result.metadata.get('company_name', 'Unknown')}")
+                print(f"Content: {result.page_content[:200]}...")
+        
+        elif choice == "4":
+            info = manager.get_vectorstore_info()
+            if info:
+                print(f"\n📊 Vector Store Information:")
+                print(f"Total chunks: {info.get('total_chunks', 0)}")
+                print(f"Companies: {', '.join(info.get('companies', []))}")
+                print(f"Years: {', '.join(info.get('years', []))}")
+                print(f"Sources: {len(info.get('sources', []))} files")
+        
+        elif choice == "5":
+            company = input("Company name (optional): ").strip()
+            year = input("Year (optional): ").strip()
+            
+            filters = {}
+            if company:
+                filters["company_name"] = company
+            if year:
+                filters["report_year"] = year
+            
+            results = manager.search_by_metadata(filters)
+            print(f"\n📊 Found {len(results)} matching chunks")
+            for i, chunk in enumerate(results[:3]):
+                print(f"\n[{i+1}] {chunk['chunk_id']}")
+                print(f"Content: {chunk['content'][:150]}...")
+        
+        elif choice == "6":
+            export_path = input("Export path: ").strip()
+            if export_path:
+                manager.export_vectorstore(export_path)
+        
+        elif choice == "7":
+            break
+        
+        else:
+            print("❌ Invalid choice")
+
+if __name__ == "__main__":
+    main()
