@@ -1,7 +1,8 @@
 
 # NCV
 Modular pipeline to ingest PDFs into portable vector stores with metadata. Separates ingestion from retrieval, enabling reuse of knowledge bases across machines without reprocessing. Supports semantic search and metadata filtering for document intelligence tasks.
----  ## 📚 PDF-to-Vector Knowledge Base Pipeline  
+
+## 📚 PDF-to-Vector Knowledge Base Pipeline  
 This repository contains a modular pipeline for ingesting PDF documents into vector stores and retrieving semantically relevant content using metadata filtering. Designed for scalability and reusability, this system separates the **document ingestion** process from the **retrieval and filtering logic**, enabling seamless portability of knowledge bases across machines or environments.  #
 ## 🔧 Features  
 * **Data Ingestion**   Extracts and processes text from PDF files (including OCR if needed) and converts them into vector embeddings using sentence transformers.
