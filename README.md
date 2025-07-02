@@ -10,4 +10,4 @@ This repository contains a modular pipeline for ingesting PDF documents into vec
 * **Separation of Concerns**   Clean separation between:    * Ingestion logic (run once to create the store)   * Retrieval logic (used repeatedly in different contexts)  
 ### 🎯 Use Case  
 
-Perfect for building reusable, portable, and scalable **document intelligence systems**, especially for tasks like ESG reporting, enterprise search, and RAG (retrieval-augmented generation) pipelines.  ---  Let me know if you want this adapted for a `README.md` layout or if you'd like badges, usage examples, or diagrams included.
+Perfect for building reusable, portable, and scalable **document intelligence systems**, especially for tasks like ESG reporting, enterprise search, and RAG (retrieval-augmented generation) pipelines.  
